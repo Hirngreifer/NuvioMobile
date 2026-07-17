@@ -184,7 +184,11 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             p2pRebufferProgress = p2pRebufferProgress,
         )
         RenderPlayerModals(displayedPositionMs = displayedPositionMs)
-        RenderWatchPartyOverlays()
+        // PiP shows only the video surface: prompts/panel/toasts stay in state
+        // and reappear when the user expands back to full screen.
+        if (!isInPip) {
+            RenderWatchPartyOverlays()
+        }
     }
 }
 

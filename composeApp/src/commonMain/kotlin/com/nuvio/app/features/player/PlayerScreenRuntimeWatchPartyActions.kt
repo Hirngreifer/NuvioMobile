@@ -243,6 +243,16 @@ internal fun PlayerScreenRuntime.BindWatchPartyEffects() {
         watchPartySession?.onAppForegrounded()
     }
 
+    // Deferred prompts (PiP): report IDLE instead of SELECTING_SOURCE so the
+    // room's all-ready auto-resume never waits for someone who cannot answer.
+    val isInPip = rememberIsInPictureInPicture()
+    LaunchedEffect(isInPip, watchPartyContentPrompt, watchPartyMoveRoomPrompt, session) {
+        val active = session ?: return@LaunchedEffect
+        if (isInPip && (watchPartyContentPrompt != null || watchPartyMoveRoomPrompt != null)) {
+            active.setFollowing(false)
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             // The session is app-owned: closing the player only unbinds (-> IDLE).
