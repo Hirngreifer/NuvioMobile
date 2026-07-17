@@ -7,6 +7,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.watchparty.WatchPartyContentId
 import com.nuvio.app.features.watchparty.WatchPartyCoordinator
@@ -230,6 +232,15 @@ internal fun PlayerScreenRuntime.BindWatchPartyEffects() {
         WatchPartyCoordinator.followInPlayer.collect { request ->
             launchWatchPartyEpisodeFollow(request)
         }
+    }
+
+    // Away mode: backgrounding must not pause the room.
+    // ON_STOP fires when the app is sent to the background; ON_START fires when it returns.
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) {
+        watchPartySession?.onAppBackgrounded()
+    }
+    LifecycleEventEffect(Lifecycle.Event.ON_START) {
+        watchPartySession?.onAppForegrounded()
     }
 
     DisposableEffect(Unit) {
