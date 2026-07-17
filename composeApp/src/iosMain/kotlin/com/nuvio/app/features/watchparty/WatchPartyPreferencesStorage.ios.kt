@@ -1,8 +1,19 @@
 package com.nuvio.app.features.watchparty
 
-// Watch Party is a desktop-only feature; iOS provides no-op stubs to satisfy the expect/actual contract.
+import com.nuvio.app.core.storage.ProfileScopedKey
+import platform.Foundation.NSUserDefaults
+
 internal actual object WatchPartyPreferencesStorage {
-    actual fun loadLastRoomCode(): String? = null
-    actual fun saveLastRoomCode(code: String) = Unit
-    actual fun clearLastRoomCode() = Unit
+    private const val lastRoomCodeKey = "nuvio_watch_party_last_room_code"
+
+    actual fun loadLastRoomCode(): String? =
+        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(lastRoomCodeKey))
+
+    actual fun saveLastRoomCode(code: String) {
+        NSUserDefaults.standardUserDefaults.setObject(code, ProfileScopedKey.of(lastRoomCodeKey))
+    }
+
+    actual fun clearLastRoomCode() {
+        NSUserDefaults.standardUserDefaults.removeObjectForKey(ProfileScopedKey.of(lastRoomCodeKey))
+    }
 }

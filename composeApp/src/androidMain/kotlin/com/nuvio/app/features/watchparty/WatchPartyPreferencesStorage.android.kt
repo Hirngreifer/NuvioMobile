@@ -1,8 +1,33 @@
 package com.nuvio.app.features.watchparty
 
-// Watch Party is a desktop-only feature; Android provides no-op stubs to satisfy the expect/actual contract.
+import android.content.Context
+import android.content.SharedPreferences
+import com.nuvio.app.core.storage.ProfileScopedKey
+
 internal actual object WatchPartyPreferencesStorage {
-    actual fun loadLastRoomCode(): String? = null
-    actual fun saveLastRoomCode(code: String) = Unit
-    actual fun clearLastRoomCode() = Unit
+    private const val preferencesName = "nuvio_watch_party"
+    private const val lastRoomCodeKey = "last_room_code"
+
+    private var preferences: SharedPreferences? = null
+
+    fun initialize(context: Context) {
+        preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
+    }
+
+    actual fun loadLastRoomCode(): String? =
+        preferences?.getString(ProfileScopedKey.of(lastRoomCodeKey), null)
+
+    actual fun saveLastRoomCode(code: String) {
+        preferences
+            ?.edit()
+            ?.putString(ProfileScopedKey.of(lastRoomCodeKey), code)
+            ?.apply()
+    }
+
+    actual fun clearLastRoomCode() {
+        preferences
+            ?.edit()
+            ?.remove(ProfileScopedKey.of(lastRoomCodeKey))
+            ?.apply()
+    }
 }
