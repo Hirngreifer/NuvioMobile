@@ -16,6 +16,9 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.getString
 import kotlin.random.Random
@@ -83,6 +86,22 @@ object WatchPartyCoordinator {
     val lastRoomCode: StateFlow<String?> = _lastRoomCode.asStateFlow()
 
     val isConfigured: Boolean get() = WatchPartySupabaseProvider.isConfigured
+
+    init {
+        // Party membership is bound to the profile identity: switching profiles
+        // auto-leaves the room (no auto-rejoin — the new profile joins on purpose)
+        // and reloads the profile-scoped last room code for the rejoin shortcut.
+        scope.launch {
+            ProfileRepository.state
+                .map { it.activeProfile?.profileIndex }
+                .distinctUntilChanged()
+                .drop(1)
+                .collect {
+                    if (_session.value != null) leave()
+                    _lastRoomCode.value = WatchPartyPreferencesStorage.loadLastRoomCode()
+                }
+        }
+    }
 
     fun createRoom(displayName: String? = null) = startSession(displayName) { session, name ->
         val code = session.create(name)
