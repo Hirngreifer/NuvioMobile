@@ -184,6 +184,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             p2pRebufferProgress = p2pRebufferProgress,
         )
         RenderPlayerModals(displayedPositionMs = displayedPositionMs)
+        RenderWatchPartyOverlays()
     }
 }
 
@@ -238,6 +239,28 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             },
             onSourcesClick = if (activeVideoId != null) { { openSourcesPanel() } } else null,
             onEpisodesClick = if (isSeries) { { openEpisodesPanel() } } else null,
+            onWatchPartyClick = {
+                showWatchPartyPanel = true
+                controlsVisible = true
+            },
+            watchPartyParticipantCount = if (watchPartySessionState.isActive) {
+                watchPartySessionState.participants.size
+            } else {
+                0
+            },
+            watchPartyBadge = if (watchPartySessionState.isActive) {
+                {
+                    WatchPartyBadgePill(
+                        sessionState = watchPartySessionState,
+                        onClick = {
+                            showWatchPartyPanel = true
+                            controlsVisible = true
+                        },
+                    )
+                }
+            } else {
+                null
+            },
             onOpenInExternalPlayer = args.onOpenInExternalPlayer?.let { openExternal ->
                 {
                     val loadedSubtitles = addonSubtitles
