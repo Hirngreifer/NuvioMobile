@@ -32,6 +32,12 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
     abstract val supabaseAnonKey: Property<String>
 
     @get:Input
+    abstract val watchPartySupabaseUrl: Property<String>
+
+    @get:Input
+    abstract val watchPartySupabaseAnonKey: Property<String>
+
+    @get:Input
     abstract val supabaseFallbackUrl: Property<String>
 
     @get:Input
@@ -86,6 +92,20 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |
                 |object RealtimeSyncConfig {
                 |    const val ENABLED = ${realtimeSyncEnabled.get()}
+                |}
+                """.trimMargin()
+            )
+        }
+
+        outDir.resolve("com/nuvio/app/features/watchparty").apply {
+            mkdirs()
+            resolve("WatchPartySupabaseConfig.kt").writeText(
+                """
+                |package com.nuvio.app.features.watchparty
+                |
+                |object WatchPartySupabaseConfig {
+                |    const val URL = "${watchPartySupabaseUrl.get()}"
+                |    const val ANON_KEY = "${watchPartySupabaseAnonKey.get()}"
                 |}
                 """.trimMargin()
             )
@@ -290,6 +310,8 @@ val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generat
     appVersionCode.set(releaseAppVersionCode)
     supabaseUrl.set(runtimeConfigValue("NUVIO_SUPABASE_URL"))
     supabaseAnonKey.set(runtimeConfigValue("NUVIO_SUPABASE_ANON_KEY"))
+    watchPartySupabaseUrl.set(runtimeConfigValue("NUVIO_WATCHPARTY_SUPABASE_URL"))
+    watchPartySupabaseAnonKey.set(runtimeConfigValue("NUVIO_WATCHPARTY_SUPABASE_ANON_KEY"))
     supabaseFallbackUrl.set(runtimeConfigValue("NUVIO_SUPABASE_FALLBACK_URL"))
     sentryDsn.set(runtimeConfigValue("SENTRY_DSN"))
     sentryEnvironment.set(
