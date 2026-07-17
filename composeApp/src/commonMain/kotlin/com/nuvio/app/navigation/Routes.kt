@@ -147,3 +147,10 @@ data class PlayerRoute(
     override val hidesNavigationBar: Boolean
         get() = true
 }
+
+@Serializable
+data class WatchPartyRoute(override val title: String = "") : AppRoute {
+    /** Lobby lives on the Home stack on iOS native navigation. */
+    override val preferredTabName: String
+        get() = "Home"
+}

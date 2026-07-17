@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -226,6 +227,10 @@ import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.WatchProgressSourceCoordinator
 import com.nuvio.app.features.watchprogress.nextUpDismissKey
 import com.nuvio.app.features.watchprogress.toContinueWatchingItem
+import com.nuvio.app.features.watchparty.WatchPartyBannerHost
+import com.nuvio.app.features.watchparty.WatchPartyCoordinator
+import com.nuvio.app.features.watchparty.WatchPartyHomeEntry
+import com.nuvio.app.features.watchparty.WatchPartyScreen
 import com.nuvio.app.features.watching.application.WatchingActions
 import com.nuvio.app.features.watching.application.WatchingState
 import kotlinx.coroutines.flow.Flow
@@ -868,6 +873,7 @@ private fun MainAppContent(
     val supportersSettingsTitle = stringResource(Res.string.compose_settings_page_supporters_contributors)
     val licensesSettingsTitle = stringResource(Res.string.compose_settings_page_licenses_attributions)
     val collectionsTitle = stringResource(Res.string.collections_header)
+    val watchPartyTitle = stringResource(Res.string.watch_party_screen_title)
     val newCollectionTitle = stringResource(Res.string.collections_new)
     val detailsFallbackTitle = stringResource(Res.string.meta_section_details_title)
     val isTraktLibrarySource = libraryUiState.sourceMode == LibrarySourceMode.TRAKT
@@ -1519,6 +1525,7 @@ private fun MainAppContent(
             resumeProgressFraction: Float?,
             manualSelection: Boolean,
             startFromBeginning: Boolean,
+            isWatchPartyFollow: Boolean = false,
         ) {
             val targetResumePositionMs = if (startFromBeginning) 0L else (resumePositionMs ?: 0L)
             val targetResumeProgressFraction = if (startFromBeginning) null else resumeProgressFraction
@@ -1588,11 +1595,60 @@ private fun MainAppContent(
                     resumeProgressFraction = targetResumeProgressFraction,
                     manualSelection = manualSelection,
                     startFromBeginning = startFromBeginning,
+                    isWatchPartyFollow = isWatchPartyFollow,
                 ),
             )
             navController.navigate(
                 StreamRoute(launchId = streamLaunchId, title = title),
             )
+        }
+
+        val watchPartyFollowFailedText = stringResource(Res.string.watch_party_follow_failed)
+        LaunchedEffect(Unit) {
+            WatchPartyCoordinator.followViaLaunch.collect { request ->
+                val content = request.contentId
+                val meta = runCatching {
+                    MetaDetailsRepository.fetch(content.mediaType, content.metaId)
+                }.getOrNull()
+                if (meta == null) {
+                    WatchPartyCoordinator.markLaunchFollowFinished()
+                    NuvioToastController.show(watchPartyFollowFailedText)
+                    return@collect
+                }
+                val video = if (content.season != null || content.episode != null) {
+                    meta.videos.firstOrNull { it.season == content.season && it.episode == content.episode }
+                } else {
+                    null
+                }
+                if ((content.season != null || content.episode != null) && video == null) {
+                    WatchPartyCoordinator.markLaunchFollowFinished()
+                    NuvioToastController.show(watchPartyFollowFailedText)
+                    return@collect
+                }
+                if (navController.currentRoute is PlayerRoute) {
+                    navController.popBackStack()
+                }
+                launchPlaybackWithDownloadPreference(
+                    type = content.mediaType,
+                    videoId = video?.id ?: content.metaId,
+                    parentMetaId = content.metaId,
+                    parentMetaType = content.mediaType,
+                    title = meta.name,
+                    logo = meta.logo,
+                    poster = meta.poster,
+                    background = meta.background,
+                    seasonNumber = content.season,
+                    episodeNumber = content.episode,
+                    episodeTitle = video?.title,
+                    episodeThumbnail = video?.thumbnail,
+                    pauseDescription = null,
+                    resumePositionMs = request.resumePositionMs,
+                    resumeProgressFraction = null,
+                    manualSelection = false,
+                    startFromBeginning = request.resumePositionMs <= 0L,
+                    isWatchPartyFollow = true,
+                )
+            }
         }
 
         val onPlay: (String, String, String, String, String, String?, String?, String?, Int?, Int?, String?, String?, String?, Long?) -> Unit =
@@ -2002,6 +2058,11 @@ private fun MainAppContent(
                                             null
                                         },
                                         onCollectionsSettingsClick = { navController.navigate(CollectionsRoute(collectionsTitle)) },
+                                        onOpenWatchParty = {
+                                            if (navController.currentRoute !is WatchPartyRoute) {
+                                                navController.navigate(WatchPartyRoute(watchPartyTitle))
+                                            }
+                                        },
                                         onFolderClick = { collectionId, folderId ->
                                             val folderTitle = CollectionRepository.collections.value
                                                 .firstOrNull { it.id == collectionId }
@@ -2195,6 +2256,17 @@ private fun MainAppContent(
                     val streamRouteScope = rememberCoroutineScope()
                     var resolvingDebridStream by rememberSaveable(route.launchId) { mutableStateOf(false) }
                     var pendingP2pStreamOpen by remember { mutableStateOf<PendingP2pStreamOpen?>(null) }
+                    // StreamLaunchStore cleanup lives elsewhere; this effect only detects a
+                    // watch-party follow abandoned without starting playback (leaving
+                    // composition without having navigated to the player).
+                    val watchPartyFollowNavigatedToPlayer = remember { mutableStateOf(false) }
+                    DisposableEffect(route.launchId) {
+                        onDispose {
+                            if (launch.isWatchPartyFollow && !watchPartyFollowNavigatedToPlayer.value) {
+                                WatchPartyCoordinator.markLaunchFollowFinished()
+                            }
+                        }
+                    }
                     val shouldResolveEpisodeVideoId =
                         launch.parentMetaId != null &&
                             launch.seasonNumber != null &&
@@ -2322,6 +2394,7 @@ private fun MainAppContent(
 
                         val launchId = PlayerLaunchStore.put(playerLaunch)
                         StreamsRepository.cancelLoading()
+                        watchPartyFollowNavigatedToPlayer.value = true
                         navController.navigate(PlayerRoute(launchId = launchId, title = playerLaunch.title)) {
                             if (replaceStreamRoute) {
                                 popUpTo<StreamRoute> { inclusive = true }
@@ -2447,6 +2520,7 @@ private fun MainAppContent(
                             StreamsRepository.clear()
                             reuseNavigated = true
                             val launchId = PlayerLaunchStore.put(playerLaunch)
+                            watchPartyFollowNavigatedToPlayer.value = true
                             navController.navigate(PlayerRoute(launchId = launchId, title = playerLaunch.title)) {
                                 popUpTo<StreamRoute> { inclusive = true }
                             }
@@ -2583,6 +2657,7 @@ private fun MainAppContent(
                         StreamsRepository.consumeAutoPlay()
                         StreamsRepository.cancelLoading()
                         val launchId = PlayerLaunchStore.put(playerLaunch)
+                        watchPartyFollowNavigatedToPlayer.value = true
                         navController.navigate(PlayerRoute(launchId = launchId, title = playerLaunch.title)) {
                             popUpTo<StreamRoute> { inclusive = true }
                         }
@@ -2813,6 +2888,11 @@ private fun MainAppContent(
                             }
                         }
                     }
+                }
+                entry<WatchPartyRoute> {
+                    WatchPartyScreen(
+                        onOpenPlayback = { WatchPartyCoordinator.requestManualFollow() },
+                    )
                 }
                 entry<PlayerRoute>(
                     metadata = if (isIos) {
@@ -3498,6 +3578,18 @@ private fun MainAppContent(
                     .align(Alignment.TopCenter)
                     .zIndex(20f),
             )
+            WatchPartyBannerHost(
+                isPlayerVisible = navController.currentRoute is PlayerRoute,
+                onOpenTab = {
+                    if (navController.currentRoute !is WatchPartyRoute) {
+                        navController.navigate(WatchPartyRoute(watchPartyTitle))
+                    }
+                },
+                onJoinPlayback = { WatchPartyCoordinator.requestManualFollow() },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .zIndex(16f),
+            )
 
             }
         }
@@ -3558,6 +3650,7 @@ private fun AppTabHost(
     onTestUpdateBannerClick: (() -> Unit)? = null,
     onCollectionsSettingsClick: () -> Unit = {},
     onFolderClick: ((collectionId: String, folderId: String) -> Unit)? = null,
+    onOpenWatchParty: (() -> Unit)? = null,
     requestedSettingsPageName: String? = null,
     onRequestedSettingsPageConsumed: () -> Unit = {},
     onInitialHomeContentRendered: () -> Unit = {},
@@ -3568,18 +3661,29 @@ private fun AppTabHost(
         tabStateHolder.SaveableStateProvider(selectedTab.name) {
             when (selectedTab) {
                 AppScreenTab.Home -> {
-                    HomeScreen(
-                        modifier = Modifier.fillMaxSize(),
-                        animateCollectionGifs = animateHomeCollectionGifs,
-                        scrollToTopRequests = homeScrollToTopRequests,
-                        onCatalogClick = onCatalogClick,
-                        onPosterClick = onPosterClick,
-                        onPosterLongClick = onPosterLongClick,
-                        onContinueWatchingClick = onContinueWatchingClick,
-                        onContinueWatchingLongPress = onContinueWatchingLongPress,
-                        onFolderClick = onFolderClick,
-                        onFirstCatalogRendered = onInitialHomeContentRendered,
-                    )
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        HomeScreen(
+                            modifier = Modifier.fillMaxSize(),
+                            animateCollectionGifs = animateHomeCollectionGifs,
+                            scrollToTopRequests = homeScrollToTopRequests,
+                            onCatalogClick = onCatalogClick,
+                            onPosterClick = onPosterClick,
+                            onPosterLongClick = onPosterLongClick,
+                            onContinueWatchingClick = onContinueWatchingClick,
+                            onContinueWatchingLongPress = onContinueWatchingLongPress,
+                            onFolderClick = onFolderClick,
+                            onFirstCatalogRendered = onInitialHomeContentRendered,
+                        )
+                        if (onOpenWatchParty != null) {
+                            WatchPartyHomeEntry(
+                                onClick = onOpenWatchParty,
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .windowInsetsPadding(WindowInsets.statusBars)
+                                    .padding(top = 8.dp, end = 16.dp),
+                            )
+                        }
+                    }
                 }
 
                 AppScreenTab.Search -> {
