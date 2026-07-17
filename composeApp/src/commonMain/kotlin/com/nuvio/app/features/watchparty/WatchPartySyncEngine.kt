@@ -304,6 +304,7 @@ class WatchPartySyncEngine(
                     )
                     commands += WatchPartyPlayerCommand.Play
                     pendingPlayState = true
+                    pendingPlayStateExpiresAtMs = Long.MAX_VALUE
                 }
             }
 
@@ -584,6 +585,7 @@ class WatchPartySyncEngine(
         if (base.broadcast != null) return base
         val resume = maybeContentStartResume(nowMs) ?: return base
         pendingPlayState = true
+        pendingPlayStateExpiresAtMs = Long.MAX_VALUE
         suppressUntilMs = nowMs + config.suppressWindowMs
         return base.copy(
             commands = base.commands + WatchPartyPlayerCommand.Play,
