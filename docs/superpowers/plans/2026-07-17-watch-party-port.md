@@ -173,7 +173,7 @@ EOF
 - Modify: `composeApp/src/commonMain/kotlin/com/nuvio/app/features/player/PlayerNextEpisodeAutoPlay.kt`
 
 **Interfaces:**
-- Produces: `PlayerStreamAutoPlayPolicy(settings, currentStreamBingeGroup)` mit `val plainManualMode: Boolean`; `suspend fun PlayerScreenRuntime.awaitStreamAutoPlaySelection(innerCollectScope: CoroutineScope, policy: PlayerStreamAutoPlayPolicy, type: String?, video: MetaVideo): StreamItem?` — harte Abhängigkeit von `PlayerScreenRuntimeWatchPartyFollow.kt` (Task 4).
+- Produces: `PlayerStreamAutoPlayPolicy(settings, currentStreamBingeGroup)` mit `val plainManualMode: Boolean`; Top-Level-Funktion `internal suspend fun awaitStreamAutoPlaySelection(innerCollectScope: CoroutineScope, policy: PlayerStreamAutoPlayPolicy, type: String, video: MetaVideo): StreamItem?` — harte Abhängigkeit von `PlayerScreenRuntimeWatchPartyFollow.kt` (Task 4; dessen Aufruf `contentType ?: parentMetaType` ist dank `parentMetaType: String` non-null). Verbindlich ist die Byte-Identität mit der Desktop-Quelle, nicht diese Paraphrase.
 
 Hintergrund: Desktop-Commit `2b8f19b8` ist der **einzige** Commit, der beide Dateien berührt; Mobile hat `PlayerNextEpisodeAutoPlay.kt` seit dem Merge-Base nicht angefasst. Das per-File-Delta ist damit exakt das Refactoring und wendet verifiziert sauber an (`git apply --check` getestet am 2026-07-17).
 
