@@ -1,0 +1,578 @@
+package com.nuvio.app.features.watchparty
+
+import kotlin.math.abs
+
+data class WatchPartySyncConfig(
+    val driftToleranceMs: Long = 1_500L,
+    val seekDetectionThresholdMs: Long = 2_000L,
+    val bufferDebounceMs: Long = 700L,
+    val suppressWindowMs: Long = 500L,
+    val contentStartGraceMs: Long = 5_000L,
+    val contentStartTimeoutMs: Long = 60_000L,
+    val seekSettleTimeoutMs: Long = 15_000L,
+    val seekRetryIntervalMs: Long = 2_000L,
+)
+
+sealed interface WatchPartyPlayerCommand {
+    data object Play : WatchPartyPlayerCommand
+    data object Pause : WatchPartyPlayerCommand
+    data class SeekTo(val positionMs: Long) : WatchPartyPlayerCommand
+}
+
+/**
+ * Pure, synchronous sync protocol. Inputs are remote room states, local playback
+ * snapshots, local content changes, drift ticks, and presence syncs; outputs are
+ * player commands, states to broadcast, and presence updates. Holds no references
+ * to player, network, or clock. Not thread-safe: callers must serialize calls
+ * (the session runs everything on a single dispatcher).
+ */
+class WatchPartySyncEngine(
+    private val actorId: String,
+    private val config: WatchPartySyncConfig = WatchPartySyncConfig(),
+) {
+    data class Output(
+        val commands: List<WatchPartyPlayerCommand> = emptyList(),
+        val broadcast: WatchPartyRoomState? = null,
+        val presenceStatus: WatchPartyParticipantStatus? = null,
+        val contentPrompt: WatchPartyContentId? = null,
+        val moveRoomPrompt: WatchPartyContentId? = null,
+    )
+
+    val deviatingByChoice: Boolean
+        get() {
+            val content = localContent ?: return false
+            return pendingRoomMove?.sameContentAs(content) == true ||
+                declinedRoomMove?.sameContentAs(content) == true
+        }
+
+    fun confirmRoomMove(nowMs: Long): Output {
+        val content = localContent ?: return Output()
+        val pending = pendingRoomMove ?: return Output()
+        if (!pending.sameContentAs(content)) {
+            pendingRoomMove = null
+            return Output()
+        }
+        pendingRoomMove = null
+        declinedRoomMove = null
+        declinedRoomMoveRoomContent = null
+        realignOnNextSnapshot = false
+        pendingPlayState = false
+        suppressUntilMs = nowMs + config.suppressWindowMs
+        return Output(
+            commands = listOf(WatchPartyPlayerCommand.Pause),
+            broadcast = buildBroadcast(
+                isPlaying = false,
+                positionMs = 0L,
+                nowMs = nowMs,
+                reason = WatchPartyStateReason.CONTENT_CHANGE,
+            ),
+            presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.PAUSED),
+        )
+    }
+
+    fun declineRoomMove(): Output {
+        val pending = pendingRoomMove ?: return Output()
+        pendingRoomMove = null
+        declinedRoomMove = pending
+        declinedRoomMoveRoomContent = lastKnownState?.contentId
+        return Output()
+    }
+
+    var lastKnownState: WatchPartyRoomState? = null
+        private set
+
+    private var localContent: WatchPartyContentId? = null
+    // Survives the null from a player unbind: a full title switch on desktop is
+    // "close player → start other film", so deliberate-change detection must
+    // compare against the content the user just left, not against null.
+    private var departedContent: WatchPartyContentId? = null
+    private var lastSnapshot: WatchPartyPlaybackSnapshot? = null
+    private var lastSnapshotAtMs: Long = 0L
+    private var suppressUntilMs: Long = 0L
+    private var pendingPlayState: Boolean? = null
+    private var pendingSeekTargetMs: Long? = null
+    private var pendingSeekIssuedAtMs: Long = 0L
+    private var bufferingSinceMs: Long? = null
+    private var hasSeenReadySnapshot: Boolean = false
+    private var pendingRoomMove: WatchPartyContentId? = null
+    private var declinedRoomMove: WatchPartyContentId? = null
+    private var declinedRoomMoveRoomContent: WatchPartyContentId? = null
+    private val observedClock = mutableMapOf<String, Long>()
+    private var maxObservedSeq = 0L
+    private var hasReceivedPresence: Boolean = false
+    private var lastPresenceStatus: WatchPartyParticipantStatus? = null
+    private var realignOnNextSnapshot: Boolean = false
+    private var participantStatuses: Map<String, WatchPartyParticipantStatus> = emptyMap()
+
+    private fun observe(state: WatchPartyRoomState) {
+        state.clock.forEach { (actor, counter) ->
+            observedClock[actor] = maxOf(observedClock[actor] ?: 0L, counter)
+        }
+        if (state.seq > maxObservedSeq) maxObservedSeq = state.seq
+    }
+
+    fun onRemoteState(state: WatchPartyRoomState, nowMs: Long): Output {
+        observe(state)
+        if (state.actorId == actorId) {
+            // Echo of our own broadcast (double safety on top of receiveOwnBroadcasts = false):
+            // adopt the seq if newer, never act on it.
+            if (state.supersedes(lastKnownState)) lastKnownState = state
+            return Output()
+        }
+        if (!state.supersedes(lastKnownState)) return Output()
+        lastKnownState = state
+        return applyKnownState(nowMs)
+    }
+
+    /**
+     * Align the local player with [lastKnownState]. Emits a content prompt instead
+     * of commands when the room plays different content.
+     */
+    fun applyKnownState(nowMs: Long): Output {
+        val state = lastKnownState ?: return Output()
+        val content = localContent
+        if (content == null || !state.contentId.sameContentAs(content)) {
+            val deviatingByChoice = content != null && (
+                pendingRoomMove?.sameContentAs(content) == true ||
+                    (
+                        declinedRoomMove?.sameContentAs(content) == true &&
+                            declinedRoomMoveRoomContent?.sameContentAs(state.contentId) == true
+                        )
+                )
+            return Output(
+                contentPrompt = state.contentId.takeUnless { deviatingByChoice },
+                presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.SELECTING_SOURCE),
+            )
+        }
+        val snapshot = lastSnapshot
+            ?: return Output(presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.SELECTING_SOURCE))
+
+        val commands = mutableListOf<WatchPartyPlayerCommand>()
+        if (state.isPlaying != snapshot.isPlaying) {
+            commands += if (state.isPlaying) WatchPartyPlayerCommand.Play else WatchPartyPlayerCommand.Pause
+            pendingPlayState = state.isPlaying
+        }
+        val expectedMs = state.expectedPositionMs(nowMs)
+        if (abs(snapshot.positionMs - expectedMs) > config.driftToleranceMs) {
+            if (snapshot.isBuffering) {
+                realignOnNextSnapshot = true
+            } else {
+                commands += WatchPartyPlayerCommand.SeekTo(expectedMs)
+                pendingSeekTargetMs = expectedMs
+                pendingSeekIssuedAtMs = nowMs
+            }
+        }
+        if (commands.isNotEmpty()) {
+            suppressUntilMs = nowMs + config.suppressWindowMs
+        }
+        return Output(commands = commands, presenceStatus = updatePresenceStatus(statusFor(snapshot)))
+    }
+
+    /**
+     * Where the local player should be now, extrapolated from the previous snapshot.
+     * Position is treated as frozen while paused or buffering.
+     */
+    private fun expectedLocalPositionMs(previous: WatchPartyPlaybackSnapshot, nowMs: Long): Long =
+        if (previous.isPlaying && !previous.isBuffering) {
+            previous.positionMs + (nowMs - lastSnapshotAtMs)
+        } else {
+            previous.positionMs
+        }
+
+    private fun buildBroadcast(
+        isPlaying: Boolean,
+        positionMs: Long,
+        nowMs: Long,
+        reason: WatchPartyStateReason,
+    ): WatchPartyRoomState {
+        val nextClock = observedClock.toMutableMap()
+        nextClock[actorId] = (nextClock[actorId] ?: 0L) + 1L
+        val next = WatchPartyRoomState(
+            contentId = requireNotNull(localContent) { "cannot broadcast without local content" },
+            isPlaying = isPlaying,
+            positionMs = positionMs,
+            atWallClockMs = nowMs,
+            actorId = actorId,
+            seq = maxOf(maxObservedSeq, lastKnownState?.seq ?: 0L) + 1L,
+            reason = reason,
+            clock = nextClock,
+        )
+        observe(next)
+        lastKnownState = next
+        return next
+    }
+
+    private fun seekInFlight(nowMs: Long): Boolean {
+        if (pendingSeekTargetMs == null) return false
+        if (nowMs - pendingSeekIssuedAtMs >= config.seekSettleTimeoutMs) {
+            pendingSeekTargetMs = null
+            return false
+        }
+        return true
+    }
+
+    fun onSnapshot(snapshot: WatchPartyPlaybackSnapshot, nowMs: Long): Output {
+        val previous = lastSnapshot
+        val known = lastKnownState
+        val content = localContent
+        val contentMatches = known != null && content != null && known.contentId.sameContentAs(content)
+
+        if (!snapshot.isBuffering) hasSeenReadySnapshot = true
+
+        val arrivedAtSeekTarget = pendingSeekTargetMs?.let { target ->
+            abs(snapshot.positionMs - target) <= config.seekDetectionThresholdMs
+        } == true
+        if (arrivedAtSeekTarget) pendingSeekTargetMs = null
+        val inFlightSeek = !arrivedAtSeekTarget && seekInFlight(nowMs)
+
+        var broadcast: WatchPartyRoomState? = null
+        val commands = mutableListOf<WatchPartyPlayerCommand>()
+
+        if (realignOnNextSnapshot && contentMatches && !snapshot.isBuffering) {
+            realignOnNextSnapshot = false
+            lastSnapshot = snapshot
+            lastSnapshotAtMs = nowMs
+            return applyKnownState(nowMs)
+        }
+
+        val wasBuffering = previous?.isBuffering == true
+        if (!snapshot.isBuffering) bufferingSinceMs = null
+
+        if (known == null && hasReceivedPresence && content != null) {
+            // Empty room after join: we define the initial room state.
+            broadcast = buildBroadcast(
+                isPlaying = snapshot.isPlaying,
+                positionMs = snapshot.positionMs,
+                nowMs = nowMs,
+                reason = WatchPartyStateReason.USER,
+            )
+        } else if (contentMatches && inFlightSeek && !snapshot.isBuffering) {
+            val flipped = previous != null && snapshot.isPlaying != previous.isPlaying && !previous.isBuffering
+            if (flipped) {
+                when {
+                    pendingPlayState == snapshot.isPlaying -> pendingPlayState = null
+                    nowMs < suppressUntilMs -> Unit
+                    else -> {
+                        broadcast = buildBroadcast(
+                            isPlaying = snapshot.isPlaying,
+                            positionMs = known!!.expectedPositionMs(nowMs),
+                            nowMs = nowMs,
+                            reason = WatchPartyStateReason.USER,
+                        )
+                        pendingSeekTargetMs = null
+                        realignOnNextSnapshot = true
+                    }
+                }
+            }
+            if (broadcast == null && nowMs - pendingSeekIssuedAtMs >= config.seekRetryIntervalMs) {
+                val expectedMs = known!!.expectedPositionMs(nowMs)
+                commands += WatchPartyPlayerCommand.SeekTo(expectedMs)
+                pendingSeekTargetMs = expectedMs
+                pendingSeekIssuedAtMs = nowMs
+                suppressUntilMs = nowMs + config.suppressWindowMs
+            }
+        } else if (contentMatches && !inFlightSeek) {
+            if (snapshot.isBuffering) {
+                if (bufferingSinceMs == null) bufferingSinceMs = nowMs
+                val bufferedLongEnough = nowMs - (bufferingSinceMs ?: nowMs) >= config.bufferDebounceMs
+                if (bufferedLongEnough && known!!.isPlaying && hasSeenReadySnapshot) {
+                    broadcast = buildBroadcast(
+                        isPlaying = false,
+                        positionMs = snapshot.positionMs,
+                        nowMs = nowMs,
+                        reason = WatchPartyStateReason.BUFFER_HOLD,
+                    )
+                }
+            } else {
+                if (
+                    wasBuffering &&
+                    known!!.reason == WatchPartyStateReason.BUFFER_HOLD &&
+                    known.actorId == actorId
+                ) {
+                    broadcast = buildBroadcast(
+                        isPlaying = true,
+                        positionMs = snapshot.positionMs,
+                        nowMs = nowMs,
+                        reason = WatchPartyStateReason.AUTO_RESUME,
+                    )
+                    commands += WatchPartyPlayerCommand.Play
+                    pendingPlayState = true
+                }
+            }
+
+            if (broadcast == null && previous != null) {
+                var userAction = false
+
+                val flipped = snapshot.isPlaying != previous.isPlaying
+                if (flipped && !snapshot.isBuffering && !previous.isBuffering) {
+                    when {
+                        pendingPlayState == snapshot.isPlaying -> pendingPlayState = null
+                        nowMs < suppressUntilMs -> Unit
+                        else -> userAction = true
+                    }
+                }
+
+                val expectedLocalMs = expectedLocalPositionMs(previous, nowMs)
+                if (abs(snapshot.positionMs - expectedLocalMs) > config.seekDetectionThresholdMs) {
+                    when {
+                        arrivedAtSeekTarget -> Unit
+                        nowMs < suppressUntilMs -> Unit
+                        else -> userAction = true
+                    }
+                }
+
+                if (userAction) {
+                    broadcast = buildBroadcast(
+                        isPlaying = snapshot.isPlaying,
+                        positionMs = snapshot.positionMs,
+                        nowMs = nowMs,
+                        reason = WatchPartyStateReason.USER,
+                    )
+                }
+            }
+        }
+
+        lastSnapshot = snapshot
+        lastSnapshotAtMs = nowMs
+
+        if (
+            contentMatches &&
+            wasBuffering &&
+            !snapshot.isBuffering &&
+            !inFlightSeek &&
+            broadcast == null &&
+            commands.isEmpty()
+        ) {
+            return mergeContentStartResume(applyKnownState(nowMs), nowMs)
+        }
+
+        val status = if (known != null && !contentMatches) {
+            WatchPartyParticipantStatus.SELECTING_SOURCE
+        } else {
+            statusFor(snapshot)
+        }
+        return mergeContentStartResume(
+            Output(
+                commands = commands,
+                broadcast = broadcast,
+                presenceStatus = updatePresenceStatus(status),
+            ),
+            nowMs,
+        )
+    }
+
+    fun onBufferProbe(nowMs: Long): Output {
+        val known = lastKnownState ?: return Output()
+        val content = localContent ?: return Output()
+        if (!known.contentId.sameContentAs(content)) return Output()
+        val snapshot = lastSnapshot ?: return Output()
+        if (!snapshot.isBuffering) return Output()
+        if (!hasSeenReadySnapshot) return Output()
+        if (seekInFlight(nowMs)) return Output()
+        if (!known.isPlaying) return Output()
+        val since = bufferingSinceMs ?: nowMs.also { bufferingSinceMs = it }
+        if (nowMs - since < config.bufferDebounceMs) return Output()
+        return Output(
+            broadcast = buildBroadcast(
+                isPlaying = false,
+                positionMs = snapshot.positionMs,
+                nowMs = nowMs,
+                reason = WatchPartyStateReason.BUFFER_HOLD,
+            ),
+            presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.BUFFERING),
+        )
+    }
+
+    /**
+     * Periodic silent drift correction (spec: every 10 s, tolerance 1.5 s).
+     * Never broadcasts — it only realigns the local player.
+     */
+    fun onDriftTick(nowMs: Long): Output {
+        val state = lastKnownState ?: return Output()
+        val content = localContent ?: return Output()
+        if (!state.contentId.sameContentAs(content)) return Output()
+        val snapshot = lastSnapshot ?: return Output()
+        if (snapshot.isBuffering) return Output()
+        if (seekInFlight(nowMs)) return Output()
+
+        mergeContentStartResume(Output(), nowMs).let { if (it.broadcast != null) return it }
+
+        val expectedMs = state.expectedPositionMs(nowMs)
+        val localMs = expectedLocalPositionMs(snapshot, nowMs)
+        if (abs(localMs - expectedMs) <= config.driftToleranceMs) return Output()
+
+        pendingSeekTargetMs = expectedMs
+        pendingSeekIssuedAtMs = nowMs
+        suppressUntilMs = nowMs + config.suppressWindowMs
+        return Output(commands = listOf(WatchPartyPlayerCommand.SeekTo(expectedMs)))
+    }
+
+    /**
+     * Late-join / reconnect resync: apply the newest state carried in presence
+     * metadata. An empty room without any state makes us the state owner.
+     * Also tracks participant statuses for the all-ready auto-resume check.
+     */
+    fun onPresenceSync(payloads: List<WatchPartyPresencePayload>, nowMs: Long): Output {
+        hasReceivedPresence = true
+        participantStatuses = payloads
+            .filter { it.actorId != actorId }
+            .associate { it.actorId to it.status }
+        var best: WatchPartyRoomState? = null
+        for (payload in payloads) {
+            val state = payload.lastKnownState ?: continue
+            observe(state)
+            if (best == null || state.supersedes(best)) best = state
+        }
+        if (best != null) {
+            if (best.supersedes(lastKnownState)) {
+                lastKnownState = best
+                if (best.actorId != actorId) {
+                    return mergeContentStartResume(applyKnownState(nowMs), nowMs)
+                }
+            }
+            return mergeContentStartResume(Output(), nowMs)
+        }
+        val content = localContent
+        val snapshot = lastSnapshot
+        if (lastKnownState == null && content != null && snapshot != null) {
+            return Output(
+                broadcast = buildBroadcast(
+                    isPlaying = snapshot.isPlaying,
+                    positionMs = snapshot.positionMs,
+                    nowMs = nowMs,
+                    reason = WatchPartyStateReason.USER,
+                ),
+            )
+        }
+        return Output()
+    }
+
+    fun onLocalContentChanged(contentId: WatchPartyContentId?, nowMs: Long): Output {
+        val previous = localContent
+        localContent = contentId
+        val departed = departedContent
+        if (previous != null) departedContent = previous
+        val contentActuallyChanged = previous != null && (contentId == null || !previous.sameContentAs(contentId))
+        // "Close player → start other film": previous is null (the unbind cleared
+        // it) but the user demonstrably came from different content.
+        val switchedAcrossUnbind = previous == null && contentId != null &&
+            departed != null && !departed.sameContentAs(contentId)
+        // Realign also for the very FIRST content when the room state arrived before
+        // it (menu join: state via presence, then the follow-launch opens the player
+        // with autoplay) — otherwise nothing pauses the player in a paused room.
+        val firstContentIntoKnownRoom = previous == null && contentId != null && lastKnownState != null
+        if (contentActuallyChanged || firstContentIntoKnownRoom) {
+            // Snapshots of the previous content must not feed seek/flip detection
+            // for the new one; the first new snapshot realigns against the room.
+            // This includes the very FIRST content after a menu join: without the
+            // realign the freshly opened player autoplays past a paused room state.
+            lastSnapshot = null
+            bufferingSinceMs = null
+            realignOnNextSnapshot = true
+            hasSeenReadySnapshot = false
+        }
+        if (contentId == null) {
+            return Output(presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.IDLE))
+        }
+        val known = lastKnownState
+        if (known?.contentId?.sameContentAs(contentId) == true) {
+            pendingRoomMove = null
+        }
+        val deliberate = contentActuallyChanged ||
+            switchedAcrossUnbind ||
+            firstContentIntoKnownRoom ||
+            // Lobby start: the first content while already presence-synced in a
+            // state-less room. (Room creation from the player sets content BEFORE
+            // the first presence sync — session starts collectors before join.)
+            (previous == null && hasReceivedPresence && known == null)
+        if (deliberate && (known == null || !known.contentId.sameContentAs(contentId))) {
+            val sameTitleAsRoom = known != null &&
+                known.contentId.metaId == contentId.metaId &&
+                known.contentId.mediaType == contentId.mediaType
+            if (known != null && !sameTitleAsRoom) {
+                realignOnNextSnapshot = false
+                if (
+                    declinedRoomMove?.sameContentAs(contentId) == true &&
+                    declinedRoomMoveRoomContent?.sameContentAs(known.contentId) == true
+                ) {
+                    return Output(presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.SELECTING_SOURCE))
+                }
+                pendingRoomMove = contentId
+                return Output(
+                    moveRoomPrompt = contentId,
+                    presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.SELECTING_SOURCE),
+                )
+            }
+            // Coordinated start: the room pauses at 0:00 until every non-idle
+            // participant is ready, then auto-resumes (Task 2).
+            realignOnNextSnapshot = false
+            pendingPlayState = false
+            suppressUntilMs = nowMs + config.suppressWindowMs
+            return Output(
+                commands = listOf(WatchPartyPlayerCommand.Pause),
+                broadcast = buildBroadcast(
+                    isPlaying = false,
+                    positionMs = 0L,
+                    nowMs = nowMs,
+                    reason = WatchPartyStateReason.CONTENT_CHANGE,
+                ),
+                presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.PAUSED),
+            )
+        }
+        return applyKnownState(nowMs)
+    }
+
+    private fun statusFor(snapshot: WatchPartyPlaybackSnapshot?): WatchPartyParticipantStatus = when {
+        snapshot == null -> WatchPartyParticipantStatus.SELECTING_SOURCE
+        snapshot.isBuffering -> WatchPartyParticipantStatus.BUFFERING
+        snapshot.isPlaying -> WatchPartyParticipantStatus.PLAYING
+        else -> WatchPartyParticipantStatus.PAUSED
+    }
+
+    /** Returns the status only when it changed, so the session never spams presence updates. */
+    private fun updatePresenceStatus(status: WatchPartyParticipantStatus): WatchPartyParticipantStatus? =
+        if (status != lastPresenceStatus) {
+            lastPresenceStatus = status
+            status
+        } else {
+            null
+        }
+
+    /**
+     * All-ready auto-resume for a coordinated content start. Egalitarian: every
+     * ready client evaluates this; concurrent resumes converge via seq/tiebreaker.
+     * IDLE participants (browsing, not following) never block the start.
+     */
+    private fun maybeContentStartResume(nowMs: Long): WatchPartyRoomState? {
+        val known = lastKnownState ?: return null
+        if (known.reason != WatchPartyStateReason.CONTENT_CHANGE || known.isPlaying) return null
+        val content = localContent ?: return null
+        if (!known.contentId.sameContentAs(content)) return null
+        val snapshot = lastSnapshot ?: return null
+        if (snapshot.isBuffering) return null
+        val holdAgeMs = nowMs - known.atWallClockMs
+        if (holdAgeMs < config.contentStartGraceMs) return null
+        val othersReady = participantStatuses.values.none {
+            it == WatchPartyParticipantStatus.SELECTING_SOURCE || it == WatchPartyParticipantStatus.BUFFERING
+        }
+        if (!othersReady && holdAgeMs < config.contentStartTimeoutMs) return null
+        return buildBroadcast(
+            isPlaying = true,
+            positionMs = known.positionMs,
+            nowMs = nowMs,
+            reason = WatchPartyStateReason.AUTO_RESUME,
+        )
+    }
+
+    private fun mergeContentStartResume(base: Output, nowMs: Long): Output {
+        if (base.broadcast != null) return base
+        val resume = maybeContentStartResume(nowMs) ?: return base
+        pendingPlayState = true
+        suppressUntilMs = nowMs + config.suppressWindowMs
+        return base.copy(
+            commands = base.commands + WatchPartyPlayerCommand.Play,
+            broadcast = resume,
+            presenceStatus = updatePresenceStatus(WatchPartyParticipantStatus.PLAYING) ?: base.presenceStatus,
+        )
+    }
+}
