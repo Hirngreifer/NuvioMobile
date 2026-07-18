@@ -7,6 +7,11 @@ name: Android Build
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Zusätzlich ein echtes Release (Tag = MARKETING_VERSION) veröffentlichen, das der In-App-Updater anbietet. Vorher Version in iosApp/Configuration/Version.xcconfig bumpen (MARKETING_VERSION und CURRENT_PROJECT_VERSION)."
+        type: boolean
+        default: false
   push:
     branches: [cmp-rewrite]
     paths-ignore:
@@ -80,3 +85,18 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Android dev build (${GITHUB_SHA::7})" \
             --notes "Automatischer Build von \`cmp-rewrite\` @ ${GITHUB_SHA}. Signierte Full-Flavor-Release-APK — direkt auf dem Gerät installierbar."
+
+      # Echtes (non-prerelease) Release: nur auf manuellen Wunsch. Der In-App-Updater
+      # bietet ausschließlich solche Releases an (Channel-Match über target=cmp-rewrite,
+      # Versionsvergleich Tag vs. installierte Version). Schlägt fehl, wenn der Tag
+      # schon existiert — Version vorher in Version.xcconfig bumpen.
+      - name: Publish updater release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(grep MARKETING_VERSION iosApp/Configuration/Version.xcconfig | cut -d= -f2 | tr -d '[:space:]')
+          gh release create "$VERSION" "${{ steps.apk.outputs.name }}" \
+            --target cmp-rewrite \
+            --title "Nuvio $VERSION" \
+            --notes "Signierter Full-Flavor-Build von \`cmp-rewrite\`. Wird vom In-App-Updater angeboten."

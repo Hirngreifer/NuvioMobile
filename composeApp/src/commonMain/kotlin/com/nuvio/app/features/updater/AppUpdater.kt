@@ -23,7 +23,8 @@ import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.getString
 
-private const val gitHubOwner = "NuvioMedia"
+// Fork builds update from the fork's releases (mirrors the desktop fork, d62cd15c).
+private const val gitHubOwner = "Hirngreifer"
 private const val gitHubRepo = "NuvioMobile"
 private const val gitHubApiBase = "https://api.github.com"
 private const val releaseChannelBranch = "cmp-rewrite"
