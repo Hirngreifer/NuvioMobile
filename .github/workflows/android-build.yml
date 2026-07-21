@@ -29,7 +29,9 @@ jobs:
   build:
     # Upstream-sync merges are already built, tested and released by
     # upstream-sync.yml before it pushes them — don't build them twice.
-    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[upstream-sync]') }}
+    # startsWith against the exact merge message upstream-sync.yml writes;
+    # contains() would also skip commits that merely mention the marker.
+    if: ${{ github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'Merge upstream cmp-rewrite [upstream-sync]') }}
     uses: ./.github/workflows/build-apk.yml
     with:
       ref: ${{ github.sha }}
