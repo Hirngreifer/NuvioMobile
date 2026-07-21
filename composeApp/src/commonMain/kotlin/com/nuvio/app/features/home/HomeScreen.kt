@@ -3,6 +3,8 @@ package com.nuvio.app.features.home
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -12,6 +14,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.auth.AuthRepository
@@ -22,7 +26,9 @@ import com.nuvio.app.core.ui.LocalNuvioBottomNavigationOverlayPadding
 import com.nuvio.app.core.ui.NuvioScreen
 import com.nuvio.app.core.ui.NuvioNetworkOfflineCard
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
+import com.nuvio.app.core.ui.rememberHeroStretchState
 import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
+import com.nuvio.app.core.ui.withDuplicateSafeLazyKeys
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.enabledAddons
 import com.nuvio.app.features.cloud.CloudLibraryContentType
@@ -42,6 +48,7 @@ import com.nuvio.app.features.home.components.HomeHeroSection
 import com.nuvio.app.features.home.components.HomeSkeletonHero
 import com.nuvio.app.features.home.components.HomeSkeletonRow
 import com.nuvio.app.features.home.components.HomeContinueWatchingSectionBottomPadding
+import com.nuvio.app.features.home.components.ContinueWatchingLayout
 import com.nuvio.app.features.trakt.TRAKT_CONTINUE_WATCHING_DAYS_CAP_ALL
 import com.nuvio.app.features.trakt.TraktSettingsRepository
 import com.nuvio.app.features.trakt.WatchProgressSource
@@ -55,11 +62,13 @@ import com.nuvio.app.features.watchprogress.CachedNextUpItem
 import com.nuvio.app.features.watchprogress.ContinueWatchingEnrichmentCache
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
+import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesUiState
 import com.nuvio.app.features.watchprogress.ContinueWatchingItem
 import com.nuvio.app.features.watchprogress.ContinueWatchingSortMode
 import com.nuvio.app.features.watchprogress.isMalformedNextUpSeedContentId
 import com.nuvio.app.features.watchprogress.isSeriesTypeForContinueWatching
 import com.nuvio.app.features.watchprogress.nextUpDismissKey
+import com.nuvio.app.features.watchprogress.parseReleaseDateToEpochMs
 import com.nuvio.app.features.watchprogress.resolvedProgressKey
 import com.nuvio.app.features.watchprogress.shouldTreatAsInProgressForContinueWatching
 import com.nuvio.app.features.watchprogress.shouldUseAsCompletedSeedForContinueWatching
@@ -129,6 +138,7 @@ fun HomeScreen(
     }.collectAsStateWithLifecycle()
     val homeListState = rememberLazyListState()
     val continueWatchingListState = rememberLazyListState()
+    val upcomingListState = rememberLazyListState()
     val collections by CollectionRepository.collections.collectAsStateWithLifecycle()
     val continueWatchingPreferences by ContinueWatchingPreferencesRepository.uiState.collectAsStateWithLifecycle()
     val watchedUiState by WatchedRepository.uiState.collectAsStateWithLifecycle()
@@ -283,10 +293,17 @@ fun HomeScreen(
     val activeProfileId = profileState.activeProfile?.profileIndex ?: 1
     val cwCacheGeneration by ContinueWatchingEnrichmentCache.generation.collectAsStateWithLifecycle()
     var hasUserScrolledContinueWatching by remember(activeProfileId) { mutableStateOf(false) }
+    var hasUserScrolledUpcoming by remember(activeProfileId) { mutableStateOf(false) }
 
     LaunchedEffect(activeProfileId, continueWatchingListState) {
         snapshotFlow { continueWatchingListState.isScrollInProgress }.collect { isScrolling ->
             if (isScrolling) hasUserScrolledContinueWatching = true
+        }
+    }
+
+    LaunchedEffect(activeProfileId, upcomingListState) {
+        snapshotFlow { upcomingListState.isScrollInProgress }.collect { isScrolling ->
+            if (isScrolling) hasUserScrolledUpcoming = true
         }
     }
 
@@ -418,7 +435,7 @@ fun HomeScreen(
         )
     }
 
-    val continueWatchingItems = remember(
+    val allContinueWatchingItems = remember(
         visibleContinueWatchingEntries,
         cachedInProgressItems,
         effectivNextUpItems,
@@ -436,6 +453,17 @@ fun HomeScreen(
             cloudLibraryUiState = cloudLibraryUiState,
         )
     }
+    val (continueWatchingItems, upcomingItems) = remember(
+        allContinueWatchingItems,
+        continueWatchingPreferences.sortMode,
+    ) {
+        splitUpcomingItems(
+            items = allContinueWatchingItems,
+            mode = continueWatchingPreferences.sortMode,
+        )
+    }
+    val hasContinueWatchingRows = continueWatchingItems.isNotEmpty() || upcomingItems.isNotEmpty()
+
     LaunchedEffect(activeProfileId, continueWatchingItems.isNotEmpty(), hasUserScrolledContinueWatching) {
         if (!hasUserScrolledContinueWatching && continueWatchingItems.isNotEmpty()) {
             snapshotFlow {
@@ -448,6 +476,22 @@ fun HomeScreen(
                     (index != 0 || offset != 0)
                 ) {
                     continueWatchingListState.scrollToItem(0)
+                }
+            }
+        }
+    }
+    LaunchedEffect(activeProfileId, upcomingItems.isNotEmpty(), hasUserScrolledUpcoming) {
+        if (!hasUserScrolledUpcoming && upcomingItems.isNotEmpty()) {
+            snapshotFlow {
+                upcomingListState.firstVisibleItemIndex to
+                    upcomingListState.firstVisibleItemScrollOffset
+            }.collect { (index, offset) ->
+                if (
+                    !hasUserScrolledUpcoming &&
+                    !upcomingListState.isScrollInProgress &&
+                    (index != 0 || offset != 0)
+                ) {
+                    upcomingListState.scrollToItem(0)
                 }
             }
         }
@@ -772,6 +816,9 @@ fun HomeScreen(
     val enabledHomeItems = remember(homeSettingsUiState.items) {
         homeSettingsUiState.items.filter { it.enabled }
     }
+    val keyedEnabledHomeItems = remember(enabledHomeItems) {
+        enabledHomeItems.withDuplicateSafeLazyKeys(HomeCatalogSettingsItem::key)
+    }
     val visibleSeriesPosterTargets = remember(enabledHomeItems, sectionsMap) {
         enabledHomeItems
             .filterNot { it.isCollection }
@@ -811,7 +858,7 @@ fun HomeScreen(
             maxWidth.value,
             continueWatchingPreferences.isVisible,
             continueWatchingPreferences.style,
-            continueWatchingItems.isNotEmpty(),
+            hasContinueWatchingRows,
             continueWatchingLayout,
             posterCardStyle.widthDp,
             homeSettingsUiState.hideCatalogUnderline,
@@ -820,7 +867,7 @@ fun HomeScreen(
             if (
                 maxWidth.value < 600f &&
                 continueWatchingPreferences.isVisible &&
-                continueWatchingItems.isNotEmpty()
+                hasContinueWatchingRows
             ) {
                 continueWatchingHeroViewportReserveHeight(
                     style = continueWatchingPreferences.style,
@@ -833,8 +880,15 @@ fun HomeScreen(
             }
         }
 
+        val heroStretchState = rememberHeroStretchState(homeListState)
+        val heroStretchModifier = if (showHeroSlot) {
+            Modifier.nestedScroll(heroStretchState.nestedScrollConnection)
+        } else {
+            Modifier
+        }
+
         NuvioScreen(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().then(heroStretchModifier),
             horizontalPadding = 0.dp,
             topPadding = if (showHeroSlot) 0.dp else null,
             listState = homeListState,
@@ -854,6 +908,7 @@ fun HomeScreen(
                             viewportHeight = maxHeight,
                             mobileBelowSectionHeightHint = mobileHeroBelowSectionHeightHint,
                             listState = homeListState,
+                            stretchPx = { heroStretchState.stretchPx },
                             onItemClick = onPosterClick,
                         )
 
@@ -868,22 +923,17 @@ fun HomeScreen(
 
             when {
                 !hasActiveAddons && !hasRenderableCollectionRows -> {
-                    if (continueWatchingPreferences.isVisible && continueWatchingItems.isNotEmpty()) {
-                        item(key = HOME_CONTINUE_WATCHING_SECTION_KEY) {
-                            HomeContinueWatchingSection(
-                                items = continueWatchingItems,
-                                style = continueWatchingPreferences.style,
-                                useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
-                                blurNextUp = continueWatchingPreferences.blurNextUp,
-                                modifier = Modifier.padding(bottom = HomeContinueWatchingSectionBottomPadding),
-                                sectionPadding = homeSectionPadding,
-                                layout = continueWatchingLayout,
-                                listState = continueWatchingListState,
-                                onItemClick = onContinueWatchingClick,
-                                onItemLongPress = onContinueWatchingLongPress,
-                            )
-                        }
-                    }
+                    homeContinueWatchingSections(
+                        preferences = continueWatchingPreferences,
+                        continueWatchingItems = continueWatchingItems,
+                        upcomingItems = upcomingItems,
+                        sectionPadding = homeSectionPadding,
+                        layout = continueWatchingLayout,
+                        continueWatchingListState = continueWatchingListState,
+                        upcomingListState = upcomingListState,
+                        onItemClick = onContinueWatchingClick,
+                        onItemLongPress = onContinueWatchingLongPress,
+                    )
                     item {
                         HomeEmptyStateCard(
                             modifier = Modifier.padding(horizontal = 16.dp),
@@ -894,22 +944,17 @@ fun HomeScreen(
                 }
 
                 homeUiState.isLoading && homeUiState.sections.isEmpty() && !hasRenderableCollectionRows -> {
-                    if (continueWatchingPreferences.isVisible && continueWatchingItems.isNotEmpty()) {
-                        item(key = HOME_CONTINUE_WATCHING_SECTION_KEY) {
-                            HomeContinueWatchingSection(
-                                items = continueWatchingItems,
-                                style = continueWatchingPreferences.style,
-                                useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
-                                blurNextUp = continueWatchingPreferences.blurNextUp,
-                                modifier = Modifier.padding(bottom = HomeContinueWatchingSectionBottomPadding),
-                                sectionPadding = homeSectionPadding,
-                                layout = continueWatchingLayout,
-                                listState = continueWatchingListState,
-                                onItemClick = onContinueWatchingClick,
-                                onItemLongPress = onContinueWatchingLongPress,
-                            )
-                        }
-                    }
+                    homeContinueWatchingSections(
+                        preferences = continueWatchingPreferences,
+                        continueWatchingItems = continueWatchingItems,
+                        upcomingItems = upcomingItems,
+                        sectionPadding = homeSectionPadding,
+                        layout = continueWatchingLayout,
+                        continueWatchingListState = continueWatchingListState,
+                        upcomingListState = upcomingListState,
+                        onItemClick = onContinueWatchingClick,
+                        onItemLongPress = onContinueWatchingLongPress,
+                    )
                     items(3) {
                         HomeSkeletonRow(
                             modifier = Modifier.padding(horizontal = 16.dp),
@@ -919,7 +964,7 @@ fun HomeScreen(
                 }
 
                 homeUiState.sections.isEmpty() && homeUiState.heroItems.isEmpty() &&
-                    (!continueWatchingPreferences.isVisible || continueWatchingItems.isEmpty()) &&
+                    (!continueWatchingPreferences.isVisible || !hasContinueWatchingRows) &&
                     !hasRenderableCollectionRows -> {
                     item {
                         if (networkStatusUiState.isOfflineLike) {
@@ -943,28 +988,24 @@ fun HomeScreen(
                 }
 
                 else -> {
-                    if (continueWatchingPreferences.isVisible && continueWatchingItems.isNotEmpty()) {
-                        item(key = HOME_CONTINUE_WATCHING_SECTION_KEY) {
-                            HomeContinueWatchingSection(
-                                items = continueWatchingItems,
-                                style = continueWatchingPreferences.style,
-                                useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
-                                blurNextUp = continueWatchingPreferences.blurNextUp,
-                                modifier = Modifier.padding(bottom = HomeContinueWatchingSectionBottomPadding),
-                                sectionPadding = homeSectionPadding,
-                                layout = continueWatchingLayout,
-                                listState = continueWatchingListState,
-                                onItemClick = onContinueWatchingClick,
-                                onItemLongPress = onContinueWatchingLongPress,
-                            )
-                        }
-                    }
+                    homeContinueWatchingSections(
+                        preferences = continueWatchingPreferences,
+                        continueWatchingItems = continueWatchingItems,
+                        upcomingItems = upcomingItems,
+                        sectionPadding = homeSectionPadding,
+                        layout = continueWatchingLayout,
+                        continueWatchingListState = continueWatchingListState,
+                        upcomingListState = upcomingListState,
+                        onItemClick = onContinueWatchingClick,
+                        onItemLongPress = onContinueWatchingLongPress,
+                    )
 
-                    enabledHomeItems.forEach { settingsItem ->
+                    keyedEnabledHomeItems.forEach { keyedSettingsItem ->
+                        val settingsItem = keyedSettingsItem.value
                         if (settingsItem.isCollection) {
                             val collection = collectionsMap[settingsItem.key]
                             if (collection != null) {
-                                item(key = settingsItem.key) {
+                                item(key = keyedSettingsItem.lazyKey) {
                                     HomeCollectionRowSection(
                                         collection = collection,
                                         modifier = Modifier.padding(bottom = 12.dp),
@@ -977,7 +1018,7 @@ fun HomeScreen(
                         } else {
                             val section = sectionsMap[settingsItem.key]
                             if (section != null && section.items.isNotEmpty()) {
-                                item(key = settingsItem.key) {
+                                item(key = keyedSettingsItem.lazyKey) {
                                     HomeCatalogRowSection(
                                         section = section,
                                         entries = section.items.take(HOME_CATALOG_PREVIEW_LIMIT),
@@ -1003,8 +1044,58 @@ fun HomeScreen(
     }
 }
 
+private fun LazyListScope.homeContinueWatchingSections(
+    preferences: ContinueWatchingPreferencesUiState,
+    continueWatchingItems: List<ContinueWatchingItem>,
+    upcomingItems: List<ContinueWatchingItem>,
+    sectionPadding: Dp,
+    layout: ContinueWatchingLayout,
+    continueWatchingListState: LazyListState,
+    upcomingListState: LazyListState,
+    onItemClick: ((ContinueWatchingItem) -> Unit)?,
+    onItemLongPress: ((ContinueWatchingItem) -> Unit)?,
+) {
+    if (!preferences.isVisible) return
+
+    if (continueWatchingItems.isNotEmpty()) {
+        item(key = HOME_CONTINUE_WATCHING_SECTION_KEY) {
+            HomeContinueWatchingSection(
+                items = continueWatchingItems,
+                style = preferences.style,
+                useEpisodeThumbnails = preferences.useEpisodeThumbnails,
+                blurNextUp = preferences.blurNextUp,
+                modifier = Modifier.padding(bottom = HomeContinueWatchingSectionBottomPadding),
+                sectionPadding = sectionPadding,
+                layout = layout,
+                listState = continueWatchingListState,
+                onItemClick = onItemClick,
+                onItemLongPress = onItemLongPress,
+            )
+        }
+    }
+
+    if (upcomingItems.isNotEmpty()) {
+        item(key = HOME_UPCOMING_SECTION_KEY) {
+            HomeContinueWatchingSection(
+                items = upcomingItems,
+                style = preferences.style,
+                useEpisodeThumbnails = preferences.useEpisodeThumbnails,
+                blurNextUp = preferences.blurNextUp,
+                modifier = Modifier.padding(bottom = HomeContinueWatchingSectionBottomPadding),
+                title = stringResource(Res.string.upcoming_section_title),
+                sectionPadding = sectionPadding,
+                layout = layout,
+                listState = upcomingListState,
+                onItemClick = onItemClick,
+                onItemLongPress = onItemLongPress,
+            )
+        }
+    }
+}
+
 private const val HOME_CATALOG_PREVIEW_LIMIT = 18
 private const val HOME_CONTINUE_WATCHING_SECTION_KEY = "home_continue_watching"
+private const val HOME_UPCOMING_SECTION_KEY = "home_upcoming"
 internal const val HomeContinueWatchingMaxRecentProgressItems = 300
 internal const val HomeNextUpInitialResolutionLimit = 32
 private const val MILLIS_PER_DAY = 24L * 60L * 60L * 1000L
@@ -1446,9 +1537,42 @@ internal fun buildHomeContinueWatchingItems(
         }
 
     return when (sortMode) {
-        ContinueWatchingSortMode.DEFAULT -> deduplicated.map(HomeContinueWatchingCandidate::item)
+        ContinueWatchingSortMode.DEFAULT,
+        ContinueWatchingSortMode.SPLIT_UPCOMING,
+        -> deduplicated.map(HomeContinueWatchingCandidate::item)
         ContinueWatchingSortMode.STREAMING_STYLE -> applyStreamingStyleSort(deduplicated, todayIsoDate)
     }
+}
+
+/**
+ * Splits unaired next-up episodes into a dedicated row when [ContinueWatchingSortMode.SPLIT_UPCOMING]
+ * is active. The main row keeps its recency ordering, while Upcoming is ordered by the nearest
+ * release instant with unknown dates last.
+ */
+internal fun splitUpcomingItems(
+    items: List<ContinueWatchingItem>,
+    mode: ContinueWatchingSortMode,
+    nowEpochMs: Long = WatchProgressClock.nowEpochMs(),
+): Pair<List<ContinueWatchingItem>, List<ContinueWatchingItem>> {
+    if (mode != ContinueWatchingSortMode.SPLIT_UPCOMING) {
+        return items to emptyList()
+    }
+
+    val (upcoming, main) = items.partition { item ->
+        item.isNextUp && parseReleaseDateToEpochMs(item.released)
+            ?.let { releaseEpochMs -> releaseEpochMs > nowEpochMs } == true
+    }
+    val sortedUpcoming = upcoming.sortedWith { first, second ->
+        val firstRelease = parseReleaseDateToEpochMs(first.released)
+        val secondRelease = parseReleaseDateToEpochMs(second.released)
+        when {
+            firstRelease == null && secondRelease == null -> 0
+            firstRelease == null -> 1
+            secondRelease == null -> -1
+            else -> firstRelease.compareTo(secondRelease)
+        }
+    }
+    return main to sortedUpcoming
 }
 
 private fun applyStreamingStyleSort(
