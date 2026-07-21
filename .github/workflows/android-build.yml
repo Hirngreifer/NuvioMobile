@@ -42,7 +42,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      APK_NAME: ${{ needs.build.outputs.apk_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +52,7 @@ jobs:
       - name: Update rolling android-latest prerelease
         run: |
           gh release delete android-latest --yes --cleanup-tag || true
-          gh release create android-latest "$APK_NAME" \
+          gh release create android-latest Nuvio-*.apk \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Android dev build (${GITHUB_SHA::7})" \
@@ -67,7 +66,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.publish_release
         run: |
           VERSION=$(grep MARKETING_VERSION iosApp/Configuration/Version.xcconfig | cut -d= -f2 | tr -d '[:space:]')
-          gh release create "$VERSION" "$APK_NAME" \
+          gh release create "$VERSION" Nuvio-*.apk \
             --target cmp-rewrite \
             --title "Nuvio $VERSION" \
             --notes "Signierter Full-Flavor-Build von \`cmp-rewrite\`. Wird vom In-App-Updater angeboten."

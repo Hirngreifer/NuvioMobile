@@ -126,7 +126,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       MERGE_SHA: ${{ needs.sync.outputs.merge_sha }}
-      APK_NAME: ${{ needs.build.outputs.apk_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,7 +147,7 @@ jobs:
       - name: Refresh android-latest prerelease
         run: |
           gh release delete android-latest --yes --cleanup-tag || true
-          gh release create android-latest "$APK_NAME" \
+          gh release create android-latest Nuvio-*.apk \
             --prerelease \
             --target "$MERGE_SHA" \
             --title "Android dev build (${MERGE_SHA::7})" \
@@ -165,7 +164,7 @@ jobs:
             echo "Release $VERSION existiert bereits — nichts zu tun."
             exit 0
           fi
-          gh release create "$VERSION" "$APK_NAME" \
+          gh release create "$VERSION" Nuvio-*.apk \
             --target cmp-rewrite \
             --title "Nuvio $VERSION" \
             --notes "Automatischer Sync-Build von Upstream $VERSION. Signierter Full-Flavor-Build von \`cmp-rewrite\`. Wird vom In-App-Updater angeboten."
