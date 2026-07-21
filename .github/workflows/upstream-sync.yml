@@ -103,6 +103,11 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # generateRuntimeConfigs declares local.properties as a required input;
+      # the tests don't need any real values in it.
+      - name: Provide empty local.properties
+        run: touch local.properties
+
       - name: Common tests
         run: ./gradlew :composeApp:testAndroidHostTest
 
