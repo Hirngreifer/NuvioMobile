@@ -1,0 +1,166 @@
+name: Upstream sync and release
+
+# Daily upstream sync for the fork. Merges NuvioMedia/NuvioMobile@cmp-rewrite
+# into cmp-rewrite, runs the common tests, builds the signed APK, and ONLY when
+# everything is green pushes the merge, refreshes the rolling `android-latest`
+# prerelease and — if upstream bumped MARKETING_VERSION — publishes the real
+# updater release for it. A red run pushes nothing; GitHub's failure mail is
+# the alert (merge conflicts get resolved locally).
+
+on:
+  schedule:
+    - cron: "43 3 * * *" # ~05:43 Berlin (CEST)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/NuvioMedia/NuvioMobile.git
+  UPSTREAM_BRANCH: cmp-rewrite
+
+jobs:
+  # Supabase pauses free projects after ~7 idle days; this daily ping keeps
+  # both projects awake independently of the desktop fork's sync. Separate job
+  # on purpose: a failing ping turns the run red (failure mail) without
+  # blocking the sync jobs.
+  supabase-keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping main Supabase
+        run: |
+          curl -fsS --retry 3 --retry-delay 10 -o /dev/null \
+            "${{ secrets.NUVIO_SUPABASE_URL }}/auth/v1/health" \
+            -H "apikey: ${{ secrets.NUVIO_SUPABASE_ANON_KEY }}"
+      - name: Ping watch party Supabase
+        run: |
+          curl -fsS --retry 3 --retry-delay 10 -o /dev/null \
+            "${{ secrets.NUVIO_WATCHPARTY_SUPABASE_URL }}/auth/v1/health" \
+            -H "apikey: ${{ secrets.NUVIO_WATCHPARTY_SUPABASE_ANON_KEY }}"
+
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      has_new: ${{ steps.merge.outputs.has_new }}
+      merge_sha: ${{ steps.merge.outputs.merge_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cmp-rewrite
+          fetch-depth: 0
+          # GITHUB_TOKEN may never push .github/workflows changes (GitHub App
+          # restriction), so upstream merges touching workflow files need the
+          # deploy key.
+          ssh-key: ${{ secrets.SYNC_PUSH_DEPLOY_KEY }}
+
+      - name: Merge upstream into cmp-rewrite
+        id: merge
+        run: |
+          git config user.name "nuvio-fork-bot"
+          git config user.email "actions@github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              # Manual runs always build the current branch (e.g. after a local
+              # conflict resolution or to bootstrap a missing version release).
+              echo "No new upstream commits — manual run builds current cmp-rewrite."
+              echo "has_new=true" >> "$GITHUB_OUTPUT"
+              echo "merge_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              git push --force origin "HEAD:refs/heads/ci/upstream-merge"
+              exit 0
+            fi
+            echo "No new upstream commits — nothing to do."
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A conflict fails this job -> failure mail; nothing is pushed. The
+          # [upstream-sync] marker keeps android-build.yml from rebuilding the
+          # merge once it lands on cmp-rewrite.
+          git merge -m "Merge upstream cmp-rewrite [upstream-sync]" "upstream/$UPSTREAM_BRANCH"
+          echo "has_new=true" >> "$GITHUB_OUTPUT"
+          echo "merge_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Staging branch so test and build work on the exact same merge.
+          git push --force origin "HEAD:refs/heads/ci/upstream-merge"
+
+  test:
+    needs: sync
+    if: needs.sync.outputs.has_new == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.merge_sha }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Common tests
+        run: ./gradlew :composeApp:testAndroidHostTest
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.has_new == 'true'
+    uses: ./.github/workflows/build-apk.yml
+    with:
+      ref: ${{ needs.sync.outputs.merge_sha }}
+    secrets: inherit
+
+  release:
+    needs: [sync, test, build]
+    if: needs.sync.outputs.has_new == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MERGE_SHA: ${{ needs.sync.outputs.merge_sha }}
+      APK_NAME: ${{ needs.build.outputs.apk_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.merge_sha }}
+          fetch-depth: 0
+          # Same restriction as in the sync job: pushing the merge to
+          # cmp-rewrite includes workflow-file changes.
+          ssh-key: ${{ secrets.SYNC_PUSH_DEPLOY_KEY }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nuvio-full-release-apk
+
+      - name: Push green merge to cmp-rewrite
+        run: |
+          git push origin "$MERGE_SHA:refs/heads/cmp-rewrite"
+          git push origin --delete ci/upstream-merge || true
+
+      - name: Refresh android-latest prerelease
+        run: |
+          gh release delete android-latest --yes --cleanup-tag || true
+          gh release create android-latest "$APK_NAME" \
+            --prerelease \
+            --target "$MERGE_SHA" \
+            --title "Android dev build (${MERGE_SHA::7})" \
+            --notes "Automatischer Sync-Build: Fork-cmp-rewrite + Upstream vom $(date -u +%Y-%m-%d). Signierte Full-Flavor-Release-APK — direkt auf dem Gerät installierbar."
+
+      # The in-app updater only offers non-prerelease releases whose
+      # target_commitish matches the cmp-rewrite channel, comparing the tag
+      # against the installed version. Publishing here (idempotent: only when
+      # the tag is missing) is what delivers upstream version bumps to phones.
+      - name: Publish updater release for new version
+        run: |
+          VERSION=$(grep MARKETING_VERSION iosApp/Configuration/Version.xcconfig | cut -d= -f2 | tr -d '[:space:]')
+          if gh release view "$VERSION" --json tagName >/dev/null 2>&1; then
+            echo "Release $VERSION existiert bereits — nichts zu tun."
+            exit 0
+          fi
+          gh release create "$VERSION" "$APK_NAME" \
+            --target cmp-rewrite \
+            --title "Nuvio $VERSION" \
+            --notes "Automatischer Sync-Build von Upstream $VERSION. Signierter Full-Flavor-Build von \`cmp-rewrite\`. Wird vom In-App-Updater angeboten."

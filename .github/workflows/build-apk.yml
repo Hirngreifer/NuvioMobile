@@ -1,0 +1,75 @@
+name: Build APK
+
+# Reusable fork build path: keystore, runtime-config secrets and the signed
+# full-flavor release APK live in exactly one place. Called with
+# `secrets: inherit` by android-build.yml (push builds) and upstream-sync.yml
+# (nightly sync builds).
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref or SHA to build"
+        type: string
+        required: true
+    outputs:
+      apk_name:
+        description: "File name of the produced APK"
+        value: ${{ jobs.build.outputs.apk_name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      apk_name: ${{ steps.apk.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore release keystore
+        run: printf '%s' "${{ secrets.NUVIO_RELEASE_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/nuvio-release.keystore"
+
+      - name: Write signing config
+        run: |
+          cat >> local.properties <<EOF
+          NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/nuvio-release.keystore
+          NUVIO_RELEASE_STORE_PASSWORD=${{ secrets.NUVIO_RELEASE_STORE_PASSWORD }}
+          NUVIO_RELEASE_KEY_ALIAS=${{ secrets.NUVIO_RELEASE_KEY_ALIAS }}
+          NUVIO_RELEASE_KEY_PASSWORD=${{ secrets.NUVIO_RELEASE_KEY_PASSWORD }}
+          INTRODB_API_URL=${{ secrets.INTRODB_API_URL }}
+          EOF
+
+      - name: Build signed full release APK
+        env:
+          NUVIO_SUPABASE_URL: ${{ secrets.NUVIO_SUPABASE_URL }}
+          NUVIO_SUPABASE_ANON_KEY: ${{ secrets.NUVIO_SUPABASE_ANON_KEY }}
+          NUVIO_WATCHPARTY_SUPABASE_URL: ${{ secrets.NUVIO_WATCHPARTY_SUPABASE_URL }}
+          NUVIO_WATCHPARTY_SUPABASE_ANON_KEY: ${{ secrets.NUVIO_WATCHPARTY_SUPABASE_ANON_KEY }}
+        run: ./gradlew :androidApp:assembleFullRelease
+
+      - name: Collect APK
+        id: apk
+        run: |
+          APK_SRC=$(find androidApp/build/outputs/apk/full/release -name '*.apk' -print -quit)
+          test -n "$APK_SRC" || { echo "no APK produced"; exit 1; }
+          VERSION=$(grep MARKETING_VERSION iosApp/Configuration/Version.xcconfig | cut -d= -f2 | tr -d '[:space:]')
+          # git HEAD, not GITHUB_SHA: on sync builds the checked-out merge SHA
+          # differs from the SHA that triggered the calling workflow.
+          APK="Nuvio-${VERSION}-full-$(git rev-parse --short HEAD).apk"
+          cp "$APK_SRC" "$APK"
+          echo "name=$APK" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nuvio-full-release-apk
+          path: ${{ steps.apk.outputs.name }}
+          if-no-files-found: error

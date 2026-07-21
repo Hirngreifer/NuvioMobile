@@ -1,9 +1,9 @@
 name: Android Build
 
-# Fork-only workflow: builds a signed full-flavor release APK and publishes it
-# as the rolling `android-latest` prerelease so it can be installed directly
-# on a phone. The in-app updater only considers non-prerelease releases of the
-# upstream repo, so this never interferes with it.
+# Fork-only workflow: builds a signed full-flavor release APK (via the shared
+# build-apk.yml) and publishes it as the rolling `android-latest` prerelease so
+# it can be installed directly on a phone. The in-app updater only considers
+# non-prerelease releases of the fork, so this never interferes with it.
 
 on:
   workflow_dispatch:
@@ -27,61 +27,31 @@ concurrency:
 
 jobs:
   build:
+    # Upstream-sync merges are already built, tested and released by
+    # upstream-sync.yml before it pushes them — don't build them twice.
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[upstream-sync]') }}
+    uses: ./.github/workflows/build-apk.yml
+    with:
+      ref: ${{ github.sha }}
+    secrets: inherit
+
+  release:
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APK_NAME: ${{ needs.build.outputs.apk_name }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Restore release keystore
-        run: printf '%s' "${{ secrets.NUVIO_RELEASE_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/nuvio-release.keystore"
-
-      - name: Write signing config
-        run: |
-          cat >> local.properties <<EOF
-          NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/nuvio-release.keystore
-          NUVIO_RELEASE_STORE_PASSWORD=${{ secrets.NUVIO_RELEASE_STORE_PASSWORD }}
-          NUVIO_RELEASE_KEY_ALIAS=${{ secrets.NUVIO_RELEASE_KEY_ALIAS }}
-          NUVIO_RELEASE_KEY_PASSWORD=${{ secrets.NUVIO_RELEASE_KEY_PASSWORD }}
-          INTRODB_API_URL=${{ secrets.INTRODB_API_URL }}
-          EOF
-
-      - name: Build signed full release APK
-        env:
-          NUVIO_SUPABASE_URL: ${{ secrets.NUVIO_SUPABASE_URL }}
-          NUVIO_SUPABASE_ANON_KEY: ${{ secrets.NUVIO_SUPABASE_ANON_KEY }}
-          NUVIO_WATCHPARTY_SUPABASE_URL: ${{ secrets.NUVIO_WATCHPARTY_SUPABASE_URL }}
-          NUVIO_WATCHPARTY_SUPABASE_ANON_KEY: ${{ secrets.NUVIO_WATCHPARTY_SUPABASE_ANON_KEY }}
-        run: ./gradlew :androidApp:assembleFullRelease
-
-      - name: Collect APK
-        id: apk
-        run: |
-          APK_SRC=$(find androidApp/build/outputs/apk/full/release -name '*.apk' -print -quit)
-          test -n "$APK_SRC" || { echo "no APK produced"; exit 1; }
-          VERSION=$(grep MARKETING_VERSION iosApp/Configuration/Version.xcconfig | cut -d= -f2 | tr -d '[:space:]')
-          APK="Nuvio-${VERSION}-full-${GITHUB_SHA::7}.apk"
-          cp "$APK_SRC" "$APK"
-          echo "name=$APK" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: nuvio-full-release-apk
-          path: ${{ steps.apk.outputs.name }}
-          if-no-files-found: error
 
       - name: Update rolling android-latest prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete android-latest --yes --cleanup-tag || true
-          gh release create android-latest "${{ steps.apk.outputs.name }}" \
+          gh release create android-latest "$APK_NAME" \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Android dev build (${GITHUB_SHA::7})" \
@@ -93,11 +63,9 @@ jobs:
       # schon existiert — Version vorher in Version.xcconfig bumpen.
       - name: Publish updater release
         if: github.event_name == 'workflow_dispatch' && inputs.publish_release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(grep MARKETING_VERSION iosApp/Configuration/Version.xcconfig | cut -d= -f2 | tr -d '[:space:]')
-          gh release create "$VERSION" "${{ steps.apk.outputs.name }}" \
+          gh release create "$VERSION" "$APK_NAME" \
             --target cmp-rewrite \
             --title "Nuvio $VERSION" \
             --notes "Signierter Full-Flavor-Build von \`cmp-rewrite\`. Wird vom In-App-Updater angeboten."
