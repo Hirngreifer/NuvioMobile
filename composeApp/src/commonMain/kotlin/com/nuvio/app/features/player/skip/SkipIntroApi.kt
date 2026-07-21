@@ -92,14 +92,19 @@ internal object SkipIntroApi {
         malId: String,
         episode: Int,
     ): AniSkipResponse? {
-        val types = "op,ed,recap,mixed-op,mixed-ed"
-        val url = "${ANISKIP_BASE}skip-times/$malId/$episode?types=$types&episodeLength=0"
+        val url = aniSkipTimesUrl(malId, episode)
         return try {
             val text = httpGetText(url)
             json.decodeFromString<AniSkipResponse>(text)
         } catch (_: Exception) {
             null
         }
+    }
+
+    fun aniSkipTimesUrl(malId: String, episode: Int): String {
+        val types = listOf("op", "ed", "recap", "mixed-op", "mixed-ed")
+            .joinToString("&") { "types=$it" }
+        return "${ANISKIP_BASE}skip-times/$malId/$episode?$types&episodeLength=0"
     }
 
     // --- ARM API (ID resolution) ---
