@@ -46,9 +46,6 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
     @get:Input
     abstract val sentryEnvironment: Property<String>
 
-    @get:Input
-    abstract val realtimeSyncEnabled: Property<Boolean>
-
     @TaskAction
     fun generate() {
         val props = Properties()
@@ -84,19 +81,6 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
             )
         }
 
-        outDir.resolve("com/nuvio/app/core/sync").apply {
-            mkdirs()
-            resolve("RealtimeSyncConfig.kt").writeText(
-                """
-                |package com.nuvio.app.core.sync
-                |
-                |object RealtimeSyncConfig {
-                |    const val ENABLED = ${realtimeSyncEnabled.get()}
-                |}
-                """.trimMargin()
-            )
-        }
-
         outDir.resolve("com/nuvio/app/features/watchparty").apply {
             mkdirs()
             resolve("WatchPartySupabaseConfig.kt").writeText(
@@ -123,6 +107,21 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |    const val CLIENT_ID = "${props.getProperty("TRAKT_CLIENT_ID", "")}" 
                 |    const val CLIENT_SECRET = "${props.getProperty("TRAKT_CLIENT_SECRET", "")}" 
                 |    const val REDIRECT_URI = "${props.getProperty("TRAKT_REDIRECT_URI", "nuvio://auth/trakt")}" 
+                |}
+                """.trimMargin()
+            )
+        }
+
+        outDir.resolve("com/nuvio/app/features/simkl").apply {
+            mkdirs()
+            resolve("SimklConfig.kt").writeText(
+                """
+                |package com.nuvio.app.features.simkl
+                |
+                |object SimklConfig {
+                |    const val CLIENT_ID = "${props.getProperty("SIMKL_CLIENT_ID", "")}"
+                |    const val REDIRECT_URI = "${props.getProperty("SIMKL_REDIRECT_URI", "nuvio://auth/simkl")}"
+                |    const val APP_NAME = "${props.getProperty("SIMKL_APP_NAME", "nuvio")}"
                 |}
                 """.trimMargin()
             )
@@ -322,7 +321,6 @@ val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generat
             else -> "production"
         }
     )
-    realtimeSyncEnabled.set(runtimeConfigBoolean("NUVIO_REALTIME_SYNC_ENABLED", true))
 }
 
 tasks.withType<KotlinCompilationTask<*>>().configureEach {
@@ -362,6 +360,10 @@ kotlin {
             cinterops {
                 create("commoncrypto") {
                     defFile(project.file("src/nativeInterop/cinterop/commoncrypto.def"))
+                    compilerOpts("-I${project.projectDir}/src/nativeInterop/cinterop")
+                }
+                create("appicon") {
+                    defFile(project.file("src/nativeInterop/cinterop/appicon.def"))
                     compilerOpts("-I${project.projectDir}/src/nativeInterop/cinterop")
                 }
                 if (iosDistribution == "full") {
