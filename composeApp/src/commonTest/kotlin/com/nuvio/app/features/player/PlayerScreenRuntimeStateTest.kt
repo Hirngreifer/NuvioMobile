@@ -12,6 +12,22 @@ import kotlin.test.assertTrue
 class PlayerScreenRuntimeStateTest {
 
     @Test
+    fun controlsStartHidden() {
+        assertFalse(PlayerScreenRuntime(testPlayerScreenArgs()).controlsVisible)
+    }
+
+    @Test
+    fun parentalGuideDoesNotRevealPlaybackControls() {
+        val runtime = PlayerScreenRuntime(testPlayerScreenArgs())
+        runtime.parentalWarnings = listOf(ParentalWarning(label = "Violence", severity = "Mild"))
+
+        runtime.tryShowParentalGuide()
+
+        assertTrue(runtime.showParentalGuide)
+        assertFalse(runtime.controlsVisible)
+    }
+
+    @Test
     fun sourceFilterUpdatesInvalidateUiWithoutPlaybackUpdates() {
         val runtime = PlayerScreenRuntime(testPlayerScreenArgs())
         val selectedFilter = derivedStateOf { runtime.sourceStreamsState.selectedFilter }
@@ -19,6 +35,18 @@ class PlayerScreenRuntimeStateTest {
         assertNull(selectedFilter.value)
 
         runtime.sourceStreamsState = StreamsUiState(selectedFilter = "addon-id")
+
+        assertEquals("addon-id", selectedFilter.value)
+    }
+
+    @Test
+    fun episodeFilterUpdatesInvalidateUiWithoutPlaybackUpdates() {
+        val runtime = PlayerScreenRuntime(testPlayerScreenArgs())
+        val selectedFilter = derivedStateOf { runtime.episodeStreamsRepoState.selectedFilter }
+
+        assertNull(selectedFilter.value)
+
+        runtime.episodeStreamsRepoState = StreamsUiState(selectedFilter = "addon-id")
 
         assertEquals("addon-id", selectedFilter.value)
     }

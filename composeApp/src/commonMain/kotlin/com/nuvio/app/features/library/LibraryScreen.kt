@@ -67,6 +67,7 @@ import com.nuvio.app.core.i18n.localizedByteUnit
 import com.nuvio.app.core.network.NetworkCondition
 import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.DisintegratingContainer
+import com.nuvio.app.core.ui.DisintegrationRequest
 import com.nuvio.app.core.ui.NuvioDropdownChip
 import com.nuvio.app.core.ui.NuvioDropdownOption
 import com.nuvio.app.core.ui.NuvioScreen
@@ -105,6 +106,7 @@ fun LibraryScreen(
     onSectionViewAllClick: ((LibrarySection, LibrarySortOption) -> Unit)? = null,
     onCloudFilePlay: ((CloudLibraryItem, CloudLibraryFile) -> Unit)? = null,
     onConnectCloudClick: (() -> Unit)? = null,
+    disintegrationRequest: DisintegrationRequest<String>? = null,
 ) {
     val uiState by remember {
         LibraryRepository.ensureLoaded()
@@ -226,6 +228,7 @@ fun LibraryScreen(
             sourceMode = uiState.sourceMode,
             sections = sortedSections,
             previewLimit = LIBRARY_SECTION_PREVIEW_LIMIT,
+            request = disintegrationRequest,
         )
     } else {
         disintegration.reset()
@@ -381,27 +384,19 @@ fun LibraryScreen(
 
                     uiState.sections.isEmpty() -> {
                         item {
-                            if (networkStatusUiState.isOfflineLike && isRemoteSource) {
-                                NuvioNetworkOfflineCard(
-                                    condition = networkStatusUiState.condition,
-                                    modifier = Modifier.padding(horizontal = 16.dp),
-                                    onRetry = retryLibraryLoad,
-                                )
-                            } else {
-                                HomeEmptyStateCard(
-                                    modifier = Modifier.padding(horizontal = 16.dp),
-                                    title = when (uiState.sourceMode) {
-                                        LibrarySourceMode.LOCAL -> stringResource(Res.string.library_empty_title)
-                                        LibrarySourceMode.TRAKT -> stringResource(Res.string.library_trakt_empty_title)
-                                        LibrarySourceMode.SIMKL -> stringResource(Res.string.library_simkl_empty_title)
-                                    },
-                                    message = when (uiState.sourceMode) {
-                                        LibrarySourceMode.LOCAL -> stringResource(Res.string.library_empty_message)
-                                        LibrarySourceMode.TRAKT -> stringResource(Res.string.library_trakt_empty_message)
-                                        LibrarySourceMode.SIMKL -> stringResource(Res.string.library_simkl_empty_message)
-                                    },
-                                )
-                            }
+                            HomeEmptyStateCard(
+                                modifier = Modifier.padding(horizontal = 16.dp),
+                                title = when (uiState.sourceMode) {
+                                    LibrarySourceMode.LOCAL -> stringResource(Res.string.library_empty_title)
+                                    LibrarySourceMode.TRAKT -> stringResource(Res.string.library_trakt_empty_title)
+                                    LibrarySourceMode.SIMKL -> stringResource(Res.string.library_simkl_empty_title)
+                                },
+                                message = when (uiState.sourceMode) {
+                                    LibrarySourceMode.LOCAL -> stringResource(Res.string.library_empty_message)
+                                    LibrarySourceMode.TRAKT -> stringResource(Res.string.library_trakt_empty_message)
+                                    LibrarySourceMode.SIMKL -> stringResource(Res.string.library_simkl_empty_message)
+                                },
+                            )
                         }
                     }
 
@@ -509,6 +504,7 @@ private fun LazyListScope.cloudLibraryContent(
             // Local filter over the already-loaded library. Matches the item name or any of its
             // file names, since the useful identifier is often in the filename, not the title.
             val trimmedQuery = searchQuery.trim()
+            val hasActiveFilter = selectedProviderId != null || effectiveSelectedType != null || trimmedQuery.isNotEmpty()
             val filteredItems = if (trimmedQuery.isEmpty()) {
                 typeFilteredItems
             } else {
@@ -549,31 +545,46 @@ private fun LazyListScope.cloudLibraryContent(
                     )
                 }
 
-                uiState.providers
-                    .filter { providerState -> selectedProviderId == null || providerState.providerId == selectedProviderId }
-                    .filter { providerState -> !providerState.errorMessage.isNullOrBlank() && providerState.items.isEmpty() }
-                    .forEach { providerState ->
-                        item(key = "cloud-error-${providerState.providerId}") {
-                            HomeEmptyStateCard(
-                                modifier = Modifier.padding(horizontal = 16.dp),
-                                title = stringResource(Res.string.cloud_library_load_failed, providerState.providerName),
-                                message = providerState.errorMessage.orEmpty(),
-                                actionLabel = stringResource(Res.string.action_retry),
-                                onActionClick = onRefresh,
-                            )
-                        }
+                val visibleProviderStates = uiState.providers.filter { providerState ->
+                    selectedProviderId == null || providerState.providerId == selectedProviderId
+                }
+                val failedProviderStates = visibleProviderStates.filter { providerState ->
+                    !providerState.errorMessage.isNullOrBlank() && providerState.items.isEmpty()
+                }
+                failedProviderStates.forEach { providerState ->
+                    item(key = "cloud-error-${providerState.providerId}") {
+                        HomeEmptyStateCard(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            title = stringResource(Res.string.cloud_library_load_failed, providerState.providerName),
+                            message = providerState.errorMessage.orEmpty(),
+                            actionLabel = stringResource(Res.string.action_retry),
+                            onActionClick = onRefresh,
+                        )
                     }
+                }
 
                 if (uiState.isRefreshing && filteredItems.isEmpty()) {
                     cloudLibrarySkeletonItems()
-                } else if (filteredItems.isEmpty()) {
+                } else if (filteredItems.isEmpty() && failedProviderStates.isEmpty()) {
                     item {
                         HomeEmptyStateCard(
                             modifier = Modifier.padding(horizontal = 16.dp),
-                            title = stringResource(Res.string.cloud_library_empty_title),
-                            message = stringResource(Res.string.cloud_library_empty_message),
-                            actionLabel = stringResource(Res.string.action_retry),
-                            onActionClick = onRefresh,
+                            title = stringResource(
+                                if (hasActiveFilter) {
+                                    Res.string.cloud_library_no_matches_title
+                                } else {
+                                    Res.string.cloud_library_empty_title
+                                },
+                            ),
+                            message = stringResource(
+                                if (hasActiveFilter) {
+                                    Res.string.cloud_library_no_matches_message
+                                } else {
+                                    Res.string.cloud_library_empty_message
+                                },
+                            ),
+                            actionLabel = if (hasActiveFilter) null else stringResource(Res.string.action_retry),
+                            onActionClick = if (hasActiveFilter) null else onRefresh,
                         )
                     }
                 } else {
@@ -1253,12 +1264,9 @@ private class LibraryExitingEntry(
     val index: Int,
 )
 
-private fun libraryGlobalKey(sectionType: String, item: LibraryItem): String =
-    "$sectionType|${item.type}|${item.id}"
-
 private class LibraryDisintegrationHolder {
     private val tracker = ScopedDisintegrationTracker<LibrarySourceMode, String, LibraryExitingEntry> { entry ->
-        libraryGlobalKey(entry.sectionType, entry.item)
+        librarySectionItemKey(entry.sectionType, entry.item)
     }
 
     fun onExited(globalKey: String) {
@@ -1273,6 +1281,7 @@ private class LibraryDisintegrationHolder {
         sourceMode: LibrarySourceMode,
         sections: List<LibrarySection>,
         previewLimit: Int,
+        request: DisintegrationRequest<String>?,
     ): List<LibraryDisplaySection> {
         val current = ArrayList<LibraryExitingEntry>()
         sections.forEach { section ->
@@ -1280,7 +1289,7 @@ private class LibraryDisintegrationHolder {
                 current += LibraryExitingEntry(item, section.type, section.displayTitle, index)
             }
         }
-        val exitingBySection = tracker.sync(sourceMode, current)
+        val exitingBySection = tracker.sync(sourceMode, current, request)
             .asSequence()
             .filter { entry -> entry.exiting }
             .map { entry -> entry.item }
@@ -1293,14 +1302,14 @@ private class LibraryDisintegrationHolder {
             val entries = ArrayList<LibraryDisplayEntry>(previewLimit + 1)
             section.items.take(previewLimit).forEach { item ->
                 entries += LibraryDisplayEntry(
-                    globalKey = libraryGlobalKey(section.type, item),
+                    globalKey = librarySectionItemKey(section.type, item),
                     item = item,
                     section = section,
                     exiting = false,
                 )
             }
             exitingBySection[section.type]?.sortedBy { it.index }?.forEach { ex ->
-                val key = libraryGlobalKey(section.type, ex.item)
+                val key = librarySectionItemKey(section.type, ex.item)
                 if (entries.none { it.globalKey == key }) {
                     entries.add(
                         ex.index.coerceIn(0, entries.size),
@@ -1315,7 +1324,7 @@ private class LibraryDisintegrationHolder {
             if (type in seenTypes) continue
             val sorted = list.sortedBy { it.index }
             val entries = sorted.map { ex ->
-                LibraryDisplayEntry(libraryGlobalKey(type, ex.item), ex.item, section = null, exiting = true)
+                LibraryDisplayEntry(librarySectionItemKey(type, ex.item), ex.item, section = null, exiting = true)
             }
             result += LibraryDisplaySection(null, type, sorted.first().sectionTitle, entries)
         }
